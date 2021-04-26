@@ -1,0 +1,614 @@
+---
+title: "Amazon review Analysis"
+author: "Mirza Naseh Ahmad"
+date: "5/25/2020"
+output:
+  word_document: default
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+
+#initialzation
+
+if(!"pacman" %in% installed.packages()[,"Package"]) install.packages("pacman")
+pacman::p_load(BiocManager, plyr, dplyr, readr, ggplot2,stringr, syuzhet, RColorBrewer,
+               wordcloud, NLP, tm, SnowballC, knitr, tidytext, tidyr,RSentiment, DT, sqldf, tidyverse, text2vec, fastTextR, tokenizers, caTools, class, rvest, caret, quanteda, doSNOW, e1071, obliqueRF,irlba, randomForest, lsa, LiblineaR,R.utils, klaR)
+
+library(klaR)
+library(R.utils)
+library(LiblineaR)
+library(lsa)
+library(quanteda)
+library(dplyr)
+library(tidyverse)
+library(text2vec)
+library(SnowballC)
+library(tidytext)
+library(stringr)
+library(stopwords)
+library(tokenizers)
+require(dplyr)
+require(data.table)
+require(caTools)
+library(fastTextR)
+library(ggplot2)
+library(doSNOW)
+library(e1071)
+library(obliqueRF)
+library(caret)
+library(irlba)
+library(randomForest)
+options(stringsAsFactors = FALSE)
+
+```
+
+```{r Loading data}
+#setting the working directory
+setwd('E:\\Ryerson\\CIND820\\Code')
+
+#Loading the Data
+
+#dowloading the data from the source
+#fn <- "amazon_reviews_us_Video_Games_v1_00.tsv.gz"
+#if ( !file.exists(fn) ) {
+# download.file("https://s3.amazonaws.com/amazon-reviews-pds/tsv/amazon_reviews_us_Automotive_v1_00.tsv.gz",
+#     fn)
+# }
+
+#gunzip("amazon_reviews_us_Automotive_v1_00.tsv.gz", remove=FALSE)
+#```
+
+datacomplete<-as.data.frame(fread("amazon_reviews_us_Automotive_v1_00.tsv"),stringsAsFactors = FALSE)
+
+
+set.seed(101)
+datareduction <- sample(1:nrow(datacomplete), 0.00065 * nrow(datacomplete))
+
+data<- datacomplete[datareduction, ]
+
+prop.table(table(datacomplete$star_rating))
+prop.table(table(data$star_rating))
+
+glimpse(data)
+
+```
+```{r Data Exploration }
+#Exploring the data
+prop.table(table(data$star_rating))
+
+boxplot(data$star_rating)
+
+data$reviewlength <- nchar(data$review_body)
+
+summary(data$reviewlength)
+
+#removing "NA" values
+sum(is.na(data$reviewlength))
+
+data<-na.omit(data)
+#removing zero text values
+
+zerotext<-data[data$reviewlength == 0 ,]
+glimpse(zerotext)
+data<-data[data$reviewlength != 0,]
+
+zerotext<-data[data$reviewlength == 0 ,]
+
+glimpse(zerotext)
+
+#filtering out non verified purchases
+vpcount = table(data$verified_purchase)
+vpcount = as.data.frame(vpcount)
+names(vpcount)[1] = 'Verified purchase'
+vpcount
+
+datavp<-data[data$verified_purchase != 'N' ,]
+
+datavp$star_rating <- as.factor(datavp$star_rating)
+
+datavp$star_rating <- ordered(datavp$star_rating, levels = c("5", "4", "3", "2", "1"))
+
+str(datavp$star_rating)
+
+
+summary(datavp$reviewlength)
+
+
+```
+
+```{r Data Split}
+
+#Splitting the data into training and test set (70/30 split)
+set.seed(354)
+indexes<- createDataPartition(datavp$star_rating, times = 1 ,p = 0.7, list = FALSE)
+
+train<-datavp[indexes,]
+test <- datavp[-indexes,]
+train <- data.table(rating = train$star_rating ,review = train$review_body , reviewlength = train$reviewlength)
+test <- data.table(rating = test$star_rating ,review = test$review_body , reviewlength = test$reviewlength)
+
+train$review[105]
+```
+```{r Preprocessing}
+#Preprocessing Pipeline
+#1. Tokenize
+#2. lower casing
+#3. stop word removal
+#4. Stemming
+#5. Adding Bigrams
+#6. Transform to DFM
+#7. Ensure Test and train DFM have the same features
+
+#tokenization and cleaning
+
+
+train.tokens <- tokens(train$review,what = "word", remove_numbers = TRUE, remove_punct = TRUE, split_hyphens = TRUE, remove_symbols = TRUE)
+
+
+train.tokens <- tokens_tolower(train.tokens)
+
+train.tokens[[105]]
+
+train.tokens<- tokens_select(train.tokens, stopwords(), selection = "remove")
+
+train.tokens[[105]]
+
+train.tokens<- tokens_wordstem(train.tokens, language = "english")
+
+train.tokens[[105]]
+
+#bag of words
+
+train.tokens.dfm <-dfm(train.tokens, tolower = FALSE)
+
+train.tokens.matrix <- as.matrix(train.tokens.dfm)
+
+view(train.tokens.matrix[1:10, 1:100])
+
+dim(train.tokens.matrix)
+
+colnames(train.tokens.matrix)[1:25]
+
+train.tokens.dfm
+
+
+```
+
+```{r Rpart and SVM}
+#Cross Validation
+train.tokens.df <-cbind(rating = train$rating, convert(train.tokens.dfm, to = "data.frame"))
+
+#clean column names. 
+names(train.tokens.df) <- make.names(names(train.tokens.df))
+# drops <- c("document")
+# train.tokens.df <- train.tokens.df[ , !(names(train.tokens.df) %in% drops)]
+
+# use caret to create stratified(because the data is not balanced) folds for 10-fold cross validation repeated 3 times
+set.seed(33445)
+cv.folds<-createMultiFolds(train$rating, k = 10, times = 3)
+
+cv.cntrl<- trainControl(method = "repeatedcv", number = 10, repeats = 3, index = cv.folds)
+
+#timing the code execution
+start.time <- Sys.time()
+
+#make a cluster to work on 8 logical cores
+cl<-makeCluster(8, type = "SOCK")
+registerDoSNOW(cl)
+
+# drops <- c("document")
+# train.tokens.df <- train.tokens.df[ , !(names(train.tokens.df) %in% drops)]
+
+rpart.cv.1 <- train(rating ~ ., data = train.tokens.df, method = "rpart", trControl = cv.cntrl, tuneLength = 7)
+svmLinear3.cv.1<- train(rating ~., data = train.tokens.df, method = "svmLinear3", trControl = cv.cntrl, tuneLength = 7)
+
+
+stopCluster(cl)
+
+#Execution time
+total.time<- Sys.time() - start.time
+total.time
+
+svmLinear3.cv.1
+rpart.cv.1
+
+```
+
+```{r TFIDF Transformation}
+#TFIDF
+#term frequency
+term.frequency <- function(row){
+  row / sum(row)
+  }
+
+#inverse document frequency
+inverse.doc.freq<- function(col){
+  corpus.size<- length(col)
+  doc.count<- length(which(col>0))
+  log10(corpus.size /doc.count)
+  
+}
+
+tf.idf <- function(tf, idf){
+  tf*idf
+}
+
+#normalize documents through TF
+train.tokens.df <- apply(train.tokens.matrix, 1, term.frequency)
+dim(train.tokens.df)
+view(train.tokens.df [1:20, 1:100])
+
+#Calculating the Inverse Document Frequency vector
+train.tokens.idf<-apply(train.tokens.matrix ,2, inverse.doc.freq)
+str(train.tokens.idf)
+
+#calculate tf-idf of our training data
+train.tokens.tfidf <- apply(train.tokens.df, 2, tf.idf, idf = train.tokens.idf)
+dim(train.tokens.tfidf)
+view(train.tokens.tfidf [1:25, 1:25])
+
+#transpose the matrix
+train.tokens.tfidf <- t(train.tokens.tfidf)
+dim(train.tokens.tfidf)
+view(train.tokens.tfidf [1:25, 1:25])
+
+#check for incomplete cases
+incomplete.cases<-which(!complete.cases(train.tokens.tfidf))
+train$review[incomplete.cases]
+
+#Replace all in incomplete cases with a 0.0
+train.tokens.tfidf[incomplete.cases,]<- rep(0.0, ncol(train.tokens.tfidf))
+dim(train.tokens.tfidf)
+sum(which(!complete.cases(train.tokens.tfidf)))
+
+
+#Final tfidf data frame
+train.tokens.tfidf.df <- cbind(rating = train$rating, data.frame(train.tokens.tfidf))
+names(train.tokens.tfidf.df) <- make.names(names(train.tokens.tfidf.df))
+view(train.tokens.tfidf.df [1:25, 1:25])
+```
+
+
+```{r Post IDF Rpart & SVM}
+
+set.seed(33445)
+cv.folds<-createMultiFolds(train$rating, k = 10, times = 3)
+
+cv.cntrl<- trainControl(method = "repeatedcv", number = 10, repeats = 3, index = cv.folds)
+
+#timing the code execution
+start.time <- Sys.time()
+
+# make a cluster to work on 8 logical cores
+cl<-makeCluster(8, type = "SOCK")
+registerDoSNOW(cl)
+
+drops <- c("document")
+train.tokens.df <- train.tokens.df[ , !(names(train.tokens.df) %in% drops)]
+
+
+rpart.cv.2<- train(rating ~ ., data = train.tokens.tfidf.df, method = "rpart", trControl = cv.cntrl, tuneLength = 7)
+svmLinear3.cv.2<- train(rating ~., data = train.tokens.tfidf.df, method = "svmLinear3", trControl = cv.cntrl, tuneLength = 7)
+
+
+stopCluster(cl)
+
+#Execution time
+total.time2<- Sys.time() - start.time
+total.time2
+
+rpart.cv.1
+rpart.cv.2
+svmLinear3.cv.1
+svmLinear3.cv.2
+
+```
+
+```{r Adding Bi-grams}
+#bi-gram (increasing the size of our matrix)
+train.tokens<- tokens_ngrams(train.tokens, n = 1:2)
+
+train.tokens[[105]]
+
+#transform to dfm and then a a matrix
+train.tokens.dfm <-dfm(train.tokens, tolower = FALSE)
+train.tokens.matrix <- as.matrix(train.tokens.dfm)
+train.tokens.dfm
+
+#normalize all the documents via TF
+train.tokens.df<- apply(train.tokens.matrix, 1, term.frequency)
+
+
+
+#Calculating the Inverse Document Frequency vector
+train.tokens.idf<-apply(train.tokens.matrix ,2, inverse.doc.freq)
+
+#calculate tf-idf of our training data
+train.tokens.tfidf <- apply(train.tokens.df, 2, tf.idf, idf = train.tokens.idf)
+
+#transpose the matrix
+train.tokens.tfidf <- t(train.tokens.tfidf)
+
+#check for incomplete cases
+incomplete.cases<-which(!complete.cases(train.tokens.tfidf))
+train$review[incomplete.cases]
+
+#Replace all in incomplete cases with a 0.0
+train.tokens.tfidf[incomplete.cases,]<- rep(0.0, ncol(train.tokens.tfidf))
+sum(which(!complete.cases(train.tokens.tfidf)))
+
+
+#Final tfidf data frame
+train.tokens.tfidf.df <- cbind(rating = train$rating, data.frame(train.tokens.tfidf))
+names(train.tokens.tfidf.df) <- make.names(names(train.tokens.tfidf.df))
+
+#applying LSA to extract relationships in our term-document Matrix and reduce dimensionality
+
+
+#Perform SVD to reduce dimentinality down to 300 columns
+#transpose our document term matrix to make it into a term document matrix to apply irlba function
+
+start.time<-Sys.time()
+train.irlba <-irlba(t(train.tokens.tfidf), nv = 200, maxit = 400)
+
+total.time3 <- Sys.time() -start.time
+total.time3
+
+
+train.svd<- data.frame(rating = train$rating, train.irlba$v)
+start.time<-Sys.time()
+
+cl<-makeCluster(8, type = "SOCK")
+registerDoSNOW(cl)
+rf.cv.1<- train(rating ~ ., data = train.svd, method = "rf", trControl = cv.cntrl, tuneLength = 7)
+stopCluster(cl)
+total.time3 <- Sys.time() -start.time
+total.time3
+
+rf.cv.1
+```
+
+
+
+```{r adding text length feature}
+#Adding text length feature to see if it improves our model
+train.svd$reviewlength <- train$reviewlength
+
+start.time<- Sys.time()
+
+cl<-makeCluster(8, type = "SOCK")
+registerDoSNOW(cl)
+
+# Rerun the training with additional feature.
+
+rf.cv.2 <- train(rating ~ ., data = train.svd, method = "rf", trControl = cv.cntrl, tuneLength = 7, importance = TRUE)
+
+stopCluster(cl)
+
+totaltime5<- Sys.time() - start.time
+totaltime5
+
+confusionMatrix(train.svd$rating, rf.cv.2$finalModel$predicted)
+
+# using Linear SVM 
+
+cl<-makeCluster(8, type = "SOCK")
+registerDoSNOW(cl)
+
+start.time<- Sys.time()
+
+svmLinear3.cv.4<- train(rating ~., data = train.svd, method = "svmLinear3", trControl = cv.cntrl, tuneLength = 7)
+
+stopCluster(cl)
+
+totaltime4<- Sys.time() - start.time
+totaltime4
+
+svmLinear3.cv.4
+
+# using KNN 
+
+cl <- makeCluster(8, type = "SOCK")
+registerDoSNOW(cl)
+
+start.time<- Sys.time()
+
+knn.cv.2<- train(rating ~., data = train.svd, method = "knn", trControl = cv.cntrl, tuneLength = 7)
+
+stopCluster(cl)
+
+totaltime4<- Sys.time() - start.time
+totaltime4
+
+
+knn.cv.2
+
+
+
+
+
+```
+
+```{r}
+#feature importance and feature engineering
+varImpPlot(rf.cv.1$finalModel)
+varImpPlot(rf.cv.2$finalModel)
+
+
+#cosine similarity
+train.similarites <- cosine(t(as.matrix(train.svd[, -c(1,ncol(train.svd))])))
+
+dim(train.similarites)
+
+lowrating.indexes <- which(train$rating < "3")
+
+train.svd$lowratingsimilarities <- rep(0.0,nrow(train.svd))
+for(i in 1:nrow(train.svd)) {
+  train.svd$lowratingsimilarities[i] <- mean(train.similarites[i,lowrating.indexes])
+}
+
+ggplot(train.svd, aes(x =lowratingsimilarities, fill = rating))+ theme_bw()+geom_histogram(binwidth = 0.05) + labs(y= "Review Count", x= "mean low rating cosine similarity", title = "Distribution of 1 rating vs all using low rating Cosine Similarity")
+
+
+cl<-makeCluster(8, type = "SOCK")
+registerDoSNOW(cl)
+start.time<- Sys.time()
+#Rerun the training with additional feature.
+rf.cv.3 <- train(rating ~ ., data = train.svd, method = "rf", trControl = cv.cntrl, tuneLength = 7, importance = TRUE)
+
+
+stopCluster(cl)
+
+totaltime6<- Sys.time() - start.time
+totaltime6
+
+confusionMatrix(train.svd$rating, rf.cv.3$finalModel$predicted)
+
+
+varImpPlot(rf.cv.3$finalModel)
+
+
+
+cl<-makeCluster(8, type = "SOCK")
+registerDoSNOW(cl)
+start.time<- Sys.time()
+#Rerun the training with additional feature.
+rf.cv.2 <- train(rating ~ ., data = train.svd, method = "rf", trControl = cv.cntrl, tuneLength = 7, importance = TRUE)
+
+stopCluster(cl)
+
+totaltime5<- Sys.time() - start.time
+totaltime5
+
+confusionMatrix(train.svd$rating, rf.cv.2$finalModel$predicted)
+
+# using Linear SVM 
+
+cl <- makeCluster(8, type = "SOCK")
+registerDoSNOW(cl)
+
+start.time<- Sys.time()
+svmLinear3.cv.5<- train(rating ~., data = train.svd, method = "svmLinear3", trControl = cv.cntrl, tuneLength = 7)
+
+stopCluster(cl)
+
+totaltime4<- Sys.time() - start.time
+totaltime4
+
+svmLinear3.cv.5
+
+# using KNN 
+
+cl <- makeCluster(8, type = "SOCK")
+registerDoSNOW(cl)
+
+start.time<- Sys.time()
+
+knn.cv.3<- train(rating ~., data = train.svd, method = "knn", trControl = cv.cntrl, tuneLength = 7)
+
+stopCluster(cl)
+
+totaltime4<- Sys.time() - start.time
+totaltime4
+
+
+knn.cv.3
+```
+
+```{r Testing the models on test data}
+
+test.tokens<- tokens(test$review, what = "word", remove_numbers = TRUE, remove_punct = TRUE, split_hyphens = TRUE, remove_symbols = TRUE)
+
+test.tokens <- tokens_tolower(test.tokens)
+
+test.tokens <- tokens_select(test.tokens, stopwords(), selection = "remove")
+
+test.tokens <- tokens_wordstem(test.tokens, language = "english")
+
+test.tokens <- tokens_ngrams(test.tokens, n = 1:2)
+
+test.tokens.dfm <- dfm(test.tokens, tolower = FALSE)
+
+
+train.tokens.dfm
+test.tokens.dfm
+
+#Ensuring that TEST and TRAIN DFM have the same dimensions
+
+
+test.tokens.dfm <- dfm_match(test.tokens.dfm, featnames(train.tokens.dfm))
+test.tokens.matrix<- as.matrix(test.tokens.dfm)
+test.tokens.dfm
+
+
+#normalize the test dataset
+test.tokens.df <- apply(test.tokens.matrix, 1, term.frequency)
+str(test.tokens.df)
+
+                           
+#TFIDF conversion of the testdata
+
+
+
+test.tokens.tfidf <- apply(test.tokens.df, 2, tf.idf, idf = train.tokens.idf)
+
+test.tokens.tfidf <-t(test.tokens.tfidf)
+
+summary(test.tokens.tfidf[1,])
+test.tokens.tfidf[is.na(test.tokens.tfidf)] <- 0.0
+summary(test.tokens.tfidf[1,])
+
+#Applying SVD matrix factorization
+
+
+sigma.inverse <- 1 / train.irlba$d
+u.transpose <- t(train.irlba$u)
+
+test.svd.raw <- t(sigma.inverse * u.transpose %*% t(test.tokens.tfidf))
+dim(test.svd.raw)
+
+
+test.svd <- data.frame(rating = test$rating, test.svd.raw, reviewlength = test$reviewlength)
+
+
+
+test.similarities<- rbind(test.svd.raw, train.irlba$v[lowrating.indexes,])
+test.similarities<- cosine(t(test.similarities))
+
+
+
+
+
+test.svd$lowratingsimilarities <- rep(0.0, nrow(test.svd))
+lowrating.cols <- (nrow(test.svd) + 1):ncol(test.similarities)
+for(i in 1:nrow(test.svd)) {
+  test.svd$lowratingsimilarities[i] <- mean(test.similarities[i, lowrating.cols])  
+}
+
+
+
+
+test.svd$lowratingsimilarities[!is.finite(test.svd$lowratingsimilarities)] <- 0
+
+
+
+
+preds<- predict(rf.cv.3, test.svd)
+
+confusionMatrix(preds, test.svd$rating)
+
+preds1<- predict(svmLinear3.cv.5, test.svd)
+confusionMatrix(preds1,test.svd$rating)
+
+pred2<- predict(knn.cv.3, test.svd)
+confusionMatrix(pred2, test.svd$rating)
+
+```
+```{r}
+
+
+```
